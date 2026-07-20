@@ -3,6 +3,7 @@ import { tabs } from "../utils/constants";
 import { IoMdAdd } from "react-icons/io";
 import { IoIosLogOut } from "react-icons/io";
 import { FiEdit } from "react-icons/fi";
+import BookingHistory from "../components/profile/BookingHistory";
 
 const Profile = () => {
     const [activeTab, setActiveTab] = React.useState("Profile");
@@ -168,7 +169,7 @@ const Profile = () => {
                     )}
 
                     {/*Bookings Section*/}
-
+                    {activeTab === "Your Orders" && <BookingHistory/>}
                 </div>
             </div>
         </>
