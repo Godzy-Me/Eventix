@@ -1,0 +1,40 @@
+# Whole stack: nginx(+React) -> Node/Express/Socket.IO -> MongoDB + Redis
+#   docker compose up -d --build
+# App: http://localhost   (port 80)
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes: [mongo-data:/data/db]
+    # ports: ["27017:27017"]   # uncomment to inspect with Compass / run seeds from your laptop
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # locks are ephemeral, no persistence needed
+
+  backend:
+    build: ./bms-backend
+    restart: unless-stopped
+    env_file: ./bms-backend/.env
+    environment:
+      NODE_ENV: production
+      PORT: 9000
+      # compose-internal service names win over whatever is in .env
+      MONGO_CONNECTION_STRING: ${MONGO_CONNECTION_STRING:-mongodb://mongo:27017/bookmyscreen}
+      REDIS_URL: redis://redis:6379
+      # frontend is served by nginx on the same origin -> plain Lax cookies work, even over http
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      ALLOW_MOCK_PAYMENTS: ${ALLOW_MOCK_PAYMENTS:-false}
+    depends_on: [mongo, redis]
+
+  frontend:
+    build: ./bms-frontend
+    restart: unless-stopped
+    ports: ["80:80"]
+    depends_on: [backend]
+
+volumes:
+  mongo-data:
