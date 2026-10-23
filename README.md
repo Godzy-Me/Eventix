@@ -1,92 +1,228 @@
-# BookMyScreen – setup & deployment guide
+# 🎬 BookMyScreen
+
+A full-stack movie ticket booking platform inspired by BookMyShow and District, with **real-time seat locking**, **OTP authentication** and **Razorpay payments**.
+
+> Two users can never pay for the same seat: seats are held atomically in Redis, broadcast live to everyone watching the show over Socket.IO, and finally booked with an all-or-nothing database update.
+
+---
+
+## ✨ Features
+
+- **Passwordless login** – 4-digit email OTP (hashed + expiring), new-user onboarding (name + phone)
+- **Secure sessions** – JWT access + refresh tokens in `httpOnly` cookies, refresh-token **rotation** with reuse detection, silent refresh through an Axios interceptor
+- **Browse & discover** – movies, recommendations, theatres and showtimes by date and location
+- **Live seat selection** – seats update in real time for every viewer: *available / selected / being booked by someone else / sold*
+- **Seat locking** – atomic Redis locks with a 5-minute TTL, countdown on checkout, automatic release on expiry
+- **Payments** – Razorpay (test mode) with server-side price calculation, signature verification, webhook support and automatic refund if seats are lost mid-payment
+- **Bookings** – confirmation page with booking ID, order history in the profile
+- **Hardened API** – Zod validation, rate-limited OTP endpoints, Helmet, role-based admin routes, regex-injection-safe search
+- **Containerised** – Dockerfiles, nginx reverse proxy and a one-command `docker compose` stack
+
+## 🧱 Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React, Vite, Tailwind CSS, React Router, TanStack Query, Axios, Socket.IO client, react-hot-toast |
+| Backend | Node.js, Express 5, TypeScript, Socket.IO, Zod |
+| Databases | **MongoDB** (users, movies, theatres, shows, bookings, payments) · **Redis** (real-time seat locks) |
+| Auth | JWT (access + refresh), OTP via Nodemailer / Mailgen |
+| Payments | Razorpay (test mode) |
+| DevOps | Docker, Docker Compose, nginx, AWS EC2 |
+
+## 🏗️ Architecture
 
 ```
-bms-backend/    Node + Express + TypeScript + Socket.IO + Redis + Mongo
-bms-frontend/   src/ (replace your src/) + Dockerfile + nginx.conf
-docker-compose.yml
+            ┌──────────────┐  /api, /socket.io   ┌────────────────────────────┐
+ Browser ──▶│ nginx + React│────────────────────▶│ Node.js backend            │
+            └──────────────┘                     │  ├─ Express (REST API)     │
+                                                 │  └─ Socket.IO (live seats) │
+                                                 └───────┬──────────────┬─────┘
+                                                         │              │
+                                                   ┌─────▼────┐   ┌─────▼────┐
+                                                   │ MongoDB  │   │  Redis   │
+                                                   │ source of│   │ seat locks│
+                                                   │  truth   │   │ (TTL)    │
+                                                   └──────────┘   └──────────┘
 ```
 
-## What was added (videos #23 – #30)
-| Video | What it is | Where |
+**Why a hybrid database?**
+MongoDB stores durable data (users, movies, shows, bookings, payments). Redis handles the one thing that must be fast and expire on its own: seat locks.
+
+**Backend request lifecycle:** `Route → Validation → Controller → Service → Model → Database`, with a global error handler for everything that fails along the way. Each feature is its own module (`auth`, `user`, `movie`, `theater`, `show`, `seat-lock`, `booking`, `payment`).
+
+### Booking flow
+
+1. User opens a show → joins the show's Socket.IO room → receives currently locked seats.
+2. User picks seats and presses **Proceed** → server atomically locks *all* of them in Redis (or none, if any is taken) and notifies everyone else.
+3. Checkout page starts a countdown. The server re-validates seats, lock ownership and show time, **recomputes the price from the database** (never trusts the client) and creates a Razorpay order.
+4. After payment, Razorpay returns a signature; the server verifies it (HMAC-SHA256), then flips the seats to `BOOKED` in a single atomic MongoDB update, confirms the booking, releases the locks and broadcasts `seat-booked`.
+5. If the seats were somehow taken while paying, the payment is refunded automatically.
+
+### Real-time events
+
+| Direction | Event | Purpose |
 |---|---|---|
-| 23 Auth | OTP sign-in wired to the API, `/auth/refresh` with token rotation, axios refresh interceptor, logout, session restore | `modules/auth`, `apis/axiosWrapper.js`, `components/auth/*`, `context/AuthContext.jsx` |
-| 24 Seat selection | Live seat grid: available / selected / booked / "being booked by someone" | `pages/SeatLayout.jsx` |
-| 25 Redis + Socket setup | ioredis client, Socket.IO on the same HTTP server, cookie-authenticated sockets | `config/redis.ts`, `socket/index.ts`, `lib/socket.js` |
-| 26 Seat locking | Atomic Lua locks in Redis (TTL 300s), events `join-show, lock-seats, locked-seats-initial, seat-locked, seat-unlocked, seat-lock-failed, seat-booked`, countdown on checkout | `modules/seat-lock`, `pages/Checkout.jsx` |
-| 27 Payment | Razorpay (test mode) order -> Checkout -> signature verification, webhook, auto-refund; built-in mock gateway when no keys | `modules/payment`, `lib/razorpay.js` |
-| 28 Booking | Booking + Payment collections, atomic seat booking, confirmation page, "Your Orders" | `modules/booking`, `pages/BookingConfirmation.jsx`, `BookingHistory.jsx` |
-| 29 Docker | Dockerfiles, nginx reverse proxy, compose (Mongo + Redis) | root + both folders |
-| 30 AWS | EC2 guide below | – |
+| client → server | `join-show` / `leave-show` | enter / leave a show's room |
+| client → server | `lock-seats` | hold the selected seats |
+| client → server | `unlock-seats` | release your held seats |
+| server → client | `locked-seats-initial` | current locks (also re-synced every 5 s so expired holds free up) |
+| server → client | `seat-locked` / `seat-unlocked` | someone held / released seats |
+| server → client | `seat-lock-failed` | your lock attempt conflicted |
+| server → client | `seat-booked` | seats were sold |
 
-Changes to your existing code you should know about:
-- **Error handler** now respects `http-errors` status codes (before, "Invalid OTP" returned 500).
-- **Security fixes**: `POST /shows|movies|theaters`, `PUT /shows/:id` (manual seat status) and `GET/POST /users` are now **admin only**; `PUT /users/activate/:id` only works on your own account and only accepts `name` + `phone` (it used to copy the whole body → anyone could make themselves admin).
-- `"start"` script was `node dist/server.ts` → `node dist/server.js`. Removed the junk `crypto` npm package.
-- Access token default 15m / refresh 7d (cookie lifetimes now match; before the refresh cookie died after 1h). For the video's demo set `ACCESS_TOKEN_EXPIRES_IN=1m`, `ACCESS_COOKIE_MAX_AGE_MS=60000`.
-- Frontend: one `AuthProvider` (it was nested 3×), `<Toaster/>` added, sign-in modal is global, `SeatLayout` no longer imports `useLocation` from the wrong place.
+### Data model
 
-## 1. Run locally
+`User` · `Movie` · `Theater` · `Show` (embeds the seat layout) · `Booking` · `Payment` · `RefreshToken`
 
-Requirements: Node 20+, MongoDB, Redis (`docker run -d -p 6379:6379 redis:7-alpine` is the easiest), and optionally a Mongo (`docker run -d -p 27017:27017 mongo:7`) or Atlas.
+## 📁 Project Structure
 
-**Backend**
+```
+bookmyscreen/
+├── bms-backend/
+│   └── src/
+│       ├── config/          # env config, MongoDB, Redis
+│       ├── middlewares/     # auth, admin guard, validation, error handler
+│       ├── modules/
+│       │   ├── auth/        # OTP, tokens, refresh rotation
+│       │   ├── user/  movie/  theater/  show/
+│       │   ├── seat-lock/   # atomic Redis (Lua) locking
+│       │   ├── booking/     # bookings + order history
+│       │   └── payment/     # Razorpay gateway, verify, webhook, refunds
+│       ├── socket/          # Socket.IO server
+│       ├── scripts/         # seeders, make-admin
+│       └── tests/           # seat-locking integration test
+├── bms-frontend/
+│   └── src/
+│       ├── apis/            # Axios instance + refresh interceptor + endpoints
+│       ├── components/  context/  hooks/  lib/  pages/
+│       └── utils/
+└── docker-compose.yml
+```
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Node.js 20+
+- MongoDB (local or Atlas) and Redis (local or Upstash)
+- A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833) (for OTP emails)
+- A [Razorpay](https://razorpay.com) account in **Test Mode** (free, no KYC)
+
+### 1. Backend
+
 ```bash
 cd bms-backend
 npm install
-cp .env.example .env      # then fill it in (see below)
-npm run seed:theaters && npm run seed:movies   # only if your DB is empty
-npm run seed:shows        # IMPORTANT: re-run it – shows are only bookable if they haven't started
-npm run dev
-```
-**Frontend**
-```bash
-cd bms-frontend            # your existing project folder
-# replace its src/ with the provided src/ ; copy Dockerfile, nginx.conf, .dockerignore if you want Docker
-npm install socket.io-client      # the only new dependency
-# .env  ->  VITE_BACKEND_URL=http://localhost:9000/api/v1
-npm run dev
+cp .env.example .env        # fill in the values below
+npm run seed:theaters
+npm run seed:movies
+npm run seed:shows          # generates shows for the next 7 days – re-run when they run out
+npm run dev                 # http://localhost:9000
 ```
 
-### Env values you must fill (`bms-backend/.env`)
-| Key | Where to get it |
+### 2. Frontend
+
+```bash
+cd bms-frontend
+npm install
+echo "VITE_BACKEND_URL=http://localhost:9000/api/v1" > .env
+npm run dev                 # http://localhost:5173
+```
+
+### Environment variables (`bms-backend/.env`)
+
+| Variable | Description |
 |---|---|
-| `MONGO_CONNECTION_STRING`, `ACCESS_TOKEN_SECRET`, `REFRESH_TOKEN_SECRET`, `HASH_SECRET`, `EMAIL_USERNAME`, `EMAIL_PASSWORD` | you already have these (secrets: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`) |
-| `REDIS_URL` | `redis://localhost:6379` locally. Free hosted option: Upstash → `rediss://default:<pw>@<host>:6379` |
-| `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | razorpay.com → sign up → toggle **Test Mode** → Account & Settings → **API Keys → Generate Test Key**. Free, no KYC, no real money. |
-| `RAZORPAY_WEBHOOK_SECRET` (optional) | Dashboard → Webhooks → add `https://<your-domain>/api/v1/payments/webhook`, events `payment.captured`, `payment.failed`, choose any secret and paste it here. Needs a public URL, so skip it locally. |
-| `FRONTEND_URL` | `http://localhost:5173` locally |
+| `PORT` | API port (default `9000`) |
+| `FRONTEND_URL` | Allowed origin(s), comma separated (CORS + Socket.IO) |
+| `MONGO_CONNECTION_STRING` | MongoDB / Atlas connection string |
+| `REDIS_URL` | e.g. `redis://localhost:6379` |
+| `SEAT_LOCK_TTL_SECONDS` | Seat hold duration (default `300`) |
+| `ACCESS_TOKEN_SECRET` · `REFRESH_TOKEN_SECRET` · `HASH_SECRET` | Long random strings |
+| `ACCESS_TOKEN_EXPIRES_IN` · `REFRESH_TOKEN_EXPIRES_IN` | Default `15m` / `7d` |
+| `COOKIE_SAMESITE` · `COOKIE_SECURE` | `lax`/`false` locally; `none`/`true` for cross-site HTTPS |
+| `EMAIL_USERNAME` · `EMAIL_PASSWORD` | Gmail address + app password |
+| `RAZORPAY_KEY_ID` · `RAZORPAY_KEY_SECRET` | Razorpay **test** keys (leave empty to use the built-in mock gateway) |
+| `RAZORPAY_WEBHOOK_SECRET` | Optional, only if you configure the webhook |
 
-**No Razorpay keys?** Leave them empty: the backend uses a **mock gateway** and Checkout shows a "simulate payment" dialog – the entire flow (lock → pay → verify → booking) still runs. Mock is disabled in production unless `ALLOW_MOCK_PAYMENTS=true`. For the interview, use real Razorpay test keys. Test card: `4111 1111 1111 1111`, any future expiry, any CVV, OTP `1234`; UPI test id `success@razorpay`.
-
-### Try it
-1. Sign in with email OTP in two different browsers (or one normal + one incognito) as two users.
-2. Open the same show, pick seats in browser A and press **Proceed** → browser B instantly sees them turn yellow ("being booked").
-3. Pay in A → they become × (sold) in B. Let the 5-min timer run out instead → they free up in B within ~5s.
-4. "Your Orders" in the profile shows the booking.
-
-Make yourself admin (to use the protected create endpoints): `npm run make-admin -- you@email.com`.
-
-Tests: `npm run test:locks` (needs Redis) – covers atomic locking, races, TTL, socket events.
-
-## 2. Docker (one command)
+Generate secrets with:
 ```bash
-# from this folder
-cp bms-backend/.env.example bms-backend/.env   # fill secrets, email, razorpay keys
-docker compose up -d --build
-docker compose exec backend npm run seed:all:prod    # seed theaters, movies, shows
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 ```
-App: http://localhost. nginx serves React and proxies `/api` and `/socket.io` to the backend, so everything is same-origin (no CORS or cookie problems). To use Atlas instead of the Mongo container, create a root `.env` with `MONGO_CONNECTION_STRING=mongodb+srv://...`.
 
-## 3. Deploy on AWS (EC2 free tier)
-1. EC2 → Launch **Ubuntu 24.04**, `t3.micro`/`t2.micro` (free-tier), 20 GB disk. Security group: allow **22** (your IP), **80**, **443**.
-2. SSH in, install Docker: `curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER` (re-login).
-3. Get the code onto the box (`git clone` your repo), create `bms-backend/.env` with production values (`FRONTEND_URL=http://<EC2-public-IP>`; real Razorpay keys; strong secrets).
-4. `docker compose up -d --build`, then the seed command above. Open `http://<EC2-public-IP>`.
-5. **HTTPS (recommended, and required for Razorpay live mode):** point a domain (a free DuckDNS subdomain works) at the instance's Elastic IP and put Caddy in front (automatic certificates), or terminate TLS on an ALB/CloudFront. Then set `COOKIE_SECURE=true` in the root `.env` and `FRONTEND_URL=https://your.domain`. Razorpay test mode works over plain HTTP, but the webhook needs a public URL.
-6. 1 GB RAM is tight for building images: add swap (`sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`) or build locally and push to ECR/Docker Hub.
-7. Stop it when not needed to avoid charges beyond the free tier.
+### Razorpay test credentials
 
-## Honest limitations
-- I could not run MongoDB, Razorpay or AWS in my sandbox. Verified: TypeScript build, frontend production build + lint, and the integration test against real Redis + Socket.IO (atomic locks, 25-way race → one winner, TTL expiry, events). The atomic booking query was checked with a JS Mongo-semantics engine, not a live Mongo. Please run the flow once end-to-end and tell me if anything misbehaves.
-- Locks are released by TTL, explicit unlock, or booking – not on disconnect (on purpose, so a hold survives the move to checkout).
-- Refunds are automatic only in the rare "paid but seats already taken" case; no user-facing cancellation (the checkout page says non-refundable).
+| Method | Value |
+|---|---|
+| Card | `4111 1111 1111 1111`, any future expiry, any CVV, OTP `1234` |
+| UPI | `success@razorpay` |
+
+### Try the real-time locking
+
+Sign in as two different users (normal + incognito window), open the same show, select seats in the first window and press **Proceed**. They turn yellow in the second window instantly, and become sold the moment payment succeeds. Let the timer expire instead and they free up again.
+
+### Admin access
+
+Admin-only endpoints (creating movies, theatres and shows) require the `admin` role:
+```bash
+npm run make-admin -- you@example.com     # sign in once first so the user exists
+```
+
+## 🧪 Tests
+
+```bash
+cd bms-backend
+npm run test:locks        # requires a running Redis
+```
+
+Covers atomic locking, concurrent races (25 users, one winner), TTL expiry, ownership-checked unlocking, socket events and payment signature verification.
+
+## 🐳 Docker
+
+```bash
+cp bms-backend/.env.example bms-backend/.env      # fill in secrets
+docker compose up -d --build
+docker compose exec backend npm run seed:all:prod
+```
+
+The app is served on **http://localhost**. nginx serves the React build and proxies `/api` and `/socket.io` to the backend, so everything is same-origin.
+
+## ☁️ Deployment (AWS EC2)
+
+1. Launch an Ubuntu EC2 instance (free-tier `t3.micro`) and open ports 22, 80 and 443.
+2. Install Docker, clone the repo and create `bms-backend/.env` with production values.
+3. `docker compose up -d --build`, then seed the database.
+4. For HTTPS, point a domain at the instance and put Caddy / an ALB in front, then set `COOKIE_SECURE=true` and `FRONTEND_URL=https://your.domain`.
+
+## 🔌 API Overview
+
+All routes are prefixed with `/api/v1`.
+
+| Area | Endpoints |
+|---|---|
+| Auth | `POST /auth/send-otp` · `POST /auth/verify-otp` · `POST /auth/refresh` · `POST /auth/logout` |
+| Users | `GET /users/me` · `PUT /users/activate/:id` |
+| Movies | `GET /movies` · `GET /movies/recommended` · `GET /movies/:id` |
+| Shows | `GET /shows?movieId&state&date` · `GET /shows/:id` |
+| Bookings | `GET /bookings/my` · `GET /bookings/:id` · `GET /bookings/locks/:showId` |
+| Payments | `POST /payments/create-order` · `POST /payments/verify` · `POST /payments/failed` · `POST /payments/cancel` · `POST /payments/webhook` |
+
+## 🔒 Security Notes
+
+- Prices are always computed server-side from the database
+- Payment signatures verified with HMAC-SHA256 using constant-time comparison; webhooks verified over the raw body
+- Refresh tokens are rotated; reuse of an old token revokes all sessions of that user
+- OTP endpoints are rate limited; OTPs are hashed with an HMAC and expire in 2 minutes
+- Mass-assignment protection on profile updates; admin-only routes for catalogue management
+
+## 🛣️ Roadmap
+
+- Admin dashboard for movies, shows and seat management
+- User-initiated cancellations and refunds
+- Email/SMS ticket delivery with QR code
+- Cloudinary-backed poster uploads
+
+
+## 📄 License
+
+ISC
