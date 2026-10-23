@@ -1,4 +1,4 @@
-# 🎬 BookMyScreen
+# 🎬 Eventix
 
 A full-stack movie ticket booking platform inspired by BookMyShow and District, with **real-time seat locking**, **OTP authentication** and **Razorpay payments**.
 
